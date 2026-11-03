@@ -1,4 +1,4 @@
-import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemMessage, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, isToolCallEventType, keyHint, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
@@ -2019,7 +2019,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let systemPromptAppend: string | undefined;
 	try {
 		traceAssertReady();
-		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt, getCurrentSystemMessage(sourceContext.messages));
 		systemPromptAppend = promptCapture
 			? projectPromptCapture(promptCapture, {
 				skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",

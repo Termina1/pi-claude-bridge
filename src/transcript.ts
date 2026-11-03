@@ -54,7 +54,7 @@ function stableRanked(sections: Map<string, string>, ranks: Map<string, number>)
 }
 
 /** Render replayed system state in the same section order as pi's prompt builder. */
-function canonicalSystemPrompt(message: SystemMessage | undefined): string | undefined {
+export function canonicalSystemPrompt(message: SystemMessage | undefined): string | undefined {
 	if (!message) return undefined;
 	const sections = new Map<string, string>(
 		Object.entries(message.sections ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),

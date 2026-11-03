@@ -1,7 +1,9 @@
+import { contentText, type SystemMessage } from "@earendil-works/pi-ai";
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import { formatProjectContext } from "./agents-md.js";
 import { debugLogPath } from "./log-paths.js";
-import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
+import { renderSkillsBlock, rewriteSkillsBlock, type SkillReadTool } from "./skills.js";
+import { canonicalSystemPrompt } from "./transcript.js";
 
 // What pi assembled for one agent, kept so the bridge can append only the
 // portable parts after Claude Code's own preset.
@@ -15,6 +17,8 @@ export type PromptCaptureInput = {
 	 *  section name. pi renders each one as `<name>\ncontent\n</name>` after the built-in
 	 *  sections; the projection does the same. */
 	sections?: Record<string, string>;
+	/** Portable sections replayed from the provider transcript, already self-delimiting. */
+	renderedSections?: Record<string, string>;
 };
 
 type InheritedPrompt = {
@@ -94,6 +98,8 @@ export class PromptCaptures {
 		// Copied, not referenced: the caller's systemPromptOptions is a live object that
 		// later before_agent_start handlers mutate.
 		capture.sections = { ...input.sections };
+		if (input.renderedSections) capture.renderedSections = { ...input.renderedSections };
+		else delete capture.renderedSections;
 		capture.source = source;
 		if (!existing || customChanged) {
 			capture.inherited = this.findInheritedPrompts(systemPrompt, input.custom);
@@ -139,13 +145,17 @@ export class PromptCaptures {
 	 * dropping it would be exactly the silent instruction loss this exists to
 	 * prevent. The descendant is not retained — its key is not ours to own.
 	 *
-	 * Throws when a prompt can be accounted for by neither route. Returning an empty
+	 * When neither route matches, an optional replayed structured system message
+	 * can supply the portable sections directly (fork/resume without local hooks).
+	 * Opaque prompts still require a capture; their text is never parsed for sections.
+	 *
+	 * Throws when a prompt can be accounted for by none of these routes. Returning an empty
 	 * capture instead would hand Claude Code a turn with none of the user's context
 	 * files, skills, custom prompt or append text, and say so only in a debug line —
 	 * silently discarding policy the user wrote down. A failed turn is recoverable;
 	 * a turn that quietly ignored its instructions is not.
 	 */
-	resolveOrDerive(systemPrompt?: string): PromptCapture | undefined {
+	resolveOrDerive(systemPrompt?: string, transcript?: SystemMessage): PromptCapture | undefined {
 		if (!systemPrompt) return undefined;
 		const exact = this.captures.get(systemPrompt);
 		if (exact) {
@@ -173,6 +183,15 @@ export class PromptCaptures {
 		// it belongs below this block.
 		const embedded = this.findInheritedPrompts(systemPrompt, systemPrompt);
 		if (embedded.length === 0) {
+			// A fork/resume can send a structured prompt no hook in this process
+			// recorded. Only that structure supplies provenance for the parts we
+			// drop; never guess from an unrecorded opaque prompt's text. Existing
+			// exact and inheritance captures stay authoritative.
+			if (transcript?.sections && Object.keys(transcript.sections).length > 0 &&
+				canonicalSystemPrompt(transcript) === systemPrompt) {
+				this.record(systemPrompt, transcriptCaptureInput(transcript), "provider_transcript");
+				return this.resolve(systemPrompt);
+			}
 			const matches = this.closestKnown(systemPrompt);
 			this.onDiagnose({ systemPrompt, matches });
 			// The query is a recorded key minus its tail. That shape is the signature of
@@ -275,6 +294,31 @@ export class PromptCaptures {
  *  forwarding it makes Claude Code's subscription path read the request as a
  *  third-party app. */
 export const PI_PREAMBLE = "You are an expert coding assistant operating inside pi";
+const PI_CURRENT_PREAMBLE = "You are a coding assistant running inside pi";
+
+// Exact known builder defaults, not prefix matches: a changed/custom preamble
+// must survive projection (and fail the sendability guard if it embeds harness).
+const PI_DEFAULT_PREAMBLES = new Set([
+	`${PI_PREAMBLE}, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.`,
+	`${PI_CURRENT_PREAMBLE}, a coding agent harness. Help users inspect files, run commands, and modify code.`,
+]);
+const PI_HARNESS_SECTIONS = new Set(["preamble", "tools", "rules", "docs", "cwd"]);
+
+function transcriptCaptureInput(message: SystemMessage): PromptCaptureInput {
+	const preamble = message.sections?.preamble;
+	const custom = [contentText(message.content), preamble && !PI_DEFAULT_PREAMBLES.has(preamble) ? preamble : ""]
+		.filter(Boolean).join("\n\n");
+	return {
+		custom: custom || undefined,
+		contextFiles: [],
+		skills: [],
+		// Section values in SystemMessage are already wrapped. Preserve them
+		// verbatim rather than parsing context-file XML or skill catalogs back
+		// into today's resource options (which may belong to another agent).
+		renderedSections: Object.fromEntries(Object.entries(message.sections ?? {})
+			.filter(([name, value]) => value !== null && !PI_HARNESS_SECTIONS.has(name))),
+	};
+}
 
 /** Both doc paths from pi's documentation-routing line. Anthropic's subscription gate
  *  rejects a system prompt carrying both, while either alone passes (issues #883, #88). */
@@ -360,6 +404,13 @@ function projectCapture(
 			if (!content) continue;
 			parts.push({ label: `the ${name} section`, text: `<${name}>\n${content}\n</${name}>` });
 		}
+		for (const [name, content] of Object.entries(capture.renderedSections ?? {})) {
+			if (!content || (name === "skills" && options.skillReadTool === "none")) continue;
+			parts.push({
+				label: `the replayed ${name} section`,
+				text: name === "skills" && options.skillReadTool === "mcp" ? rewriteSkillsBlock(content) : content,
+			});
+		}
 		assertSendablePrompt(parts, capture);
 		return parts.length > 0 ? parts.map((part) => part.text).join("\n\n") : undefined;
 	} finally {
@@ -372,7 +423,8 @@ function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCaptu
 	for (const { label, text } of parts) {
 		const offset = preambleAtLineStart(text);
 		if (offset !== -1) {
-			findings.push(`pi's preamble ("${PI_PREAMBLE}") in ${label}, at offset ${offset} of ${text.length} chars`);
+			const preamble = text.startsWith(PI_PREAMBLE, offset) ? PI_PREAMBLE : PI_CURRENT_PREAMBLE;
+			findings.push(`pi's preamble ("${preamble}") in ${label}, at offset ${offset} of ${text.length} chars`);
 		}
 		// The pair has to co-occur in one part; the two phrases split across parts are not detected.
 		if (ANTHROPIC_THIRD_PARTY_TRIGGERS.every((trigger) => text.includes(trigger))) {
@@ -396,8 +448,10 @@ function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCaptu
 /** Offset of pi's preamble at the start of a line, or -1. Mid-line mentions are someone
  *  describing pi's prompt, not pi's prompt. */
 function preambleAtLineStart(text: string): number {
-	for (let offset = text.indexOf(PI_PREAMBLE); offset !== -1; offset = text.indexOf(PI_PREAMBLE, offset + PI_PREAMBLE.length)) {
-		if (offset === 0 || text[offset - 1] === "\n") return offset;
+	for (const preamble of [PI_PREAMBLE, PI_CURRENT_PREAMBLE]) {
+		for (let offset = text.indexOf(preamble); offset !== -1; offset = text.indexOf(preamble, offset + preamble.length)) {
+			if (offset === 0 || text[offset - 1] === "\n") return offset;
+		}
 	}
 	return -1;
 }
