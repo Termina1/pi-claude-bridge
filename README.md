@@ -137,6 +137,15 @@ Two traps. Returning `systemPrompt` from `before_agent_start` makes pi replace t
 
 To add instructions, use `message`, `context`, or a system-message edit that keeps pi's prompt intact.
 
+Forked background children and resumed sessions can replay a different structured
+system prompt than their hooks record. When neither an exact nor embedded capture
+matches, the provider can project the request's named system sections directly:
+project context, appended instructions, skills and custom sections survive, while
+pi's tool/rule/docs/cwd harness and exact known default preambles do not. Custom
+preambles and extra system-message content are preserved and checked by the same
+sendability guard. This fallback needs actual `SystemMessage.sections`; it never
+parses tags in an opaque prompt, so an unknown opaque prompt still fails.
+
 ### Hooks written for Claude Code
 
 `~/.claude/settings.json` hooks fire inside bridge turns, so a hook injecting Claude-specific guidance duplicates what pi's extensions already provide. A project's `.claude/settings.json` and `.claude/settings.local.json` are not loaded, so a repo's hooks, `apiKeyHelper` and `env` never run. pi sets `PI_CODING_AGENT=true` for child processes, including the Claude Code child; a hook can skip itself on that:
